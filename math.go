@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/rsa"
 	sha1lib "crypto/sha1"
+	sha256lib "crypto/sha256"
 	"errors"
 	"math/big"
 	"math/rand"
@@ -25,6 +26,11 @@ func init() {
 
 func sha1(data []byte) []byte {
 	r := sha1lib.Sum(data)
+	return r[:]
+}
+
+func sha256(data []byte) []byte {
+	r := sha256lib.Sum256(data)
 	return r[:]
 }
 
@@ -128,6 +134,37 @@ func makeGAB(g int32, g_a, dh_prime *big.Int) (b, g_b, g_ab *big.Int) {
 	g_ab = big.NewInt(0).Exp(g_a, b, dh_prime)
 
 	return
+}
+
+func generateAESV2(msg_key, auth_key []byte, decode bool) ([]byte, []byte) {
+	var x int
+	if decode {
+		x = 8
+	} else {
+		x = 0
+	}
+
+	aes_key := make([]byte, 0, 32)
+	aes_iv := make([]byte, 0, 32)
+
+	a := make([]byte, 0, 52)
+	a = append(a, msg_key...)
+	a = append(a, auth_key[x:x+36]...)
+	sha256ByA := sha256(a)
+
+	b := make([]byte, 0, 52)
+	b = append(b, auth_key[40+x:40+x+36]...)
+	b = append(b, msg_key...)
+	sha256ByB := sha256(b)
+
+	aes_key = append(aes_key, sha256ByA[0:0+8]...)
+	aes_key = append(aes_key, sha256ByB[8:8+16]...)
+	aes_key = append(aes_key, sha256ByA[24:24+8]...)
+
+	aes_iv = append(aes_iv, sha256ByB[0:0+8]...)
+	aes_iv = append(aes_iv, sha256ByA[8:8+16]...)
+	aes_iv = append(aes_iv, sha256ByB[24:24+8]...)
+	return aes_key, aes_iv
 }
 
 func generateAES(msg_key, auth_key []byte, decode bool) ([]byte, []byte) {

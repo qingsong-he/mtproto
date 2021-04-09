@@ -5,8 +5,106 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"reflect"
 	"time"
 )
+
+func getPaddingByV2(size int) int {
+	add := (16 - (size % 16)) & 15
+	var result int = add
+	if add < 12 {
+		result = add + 16
+	}
+	return result
+}
+
+func (m *MTProto) sendPacketV2(msg TL, resp chan TL) error {
+	obj := msg.encode()
+
+	x := NewEncodeBuf(256)
+
+	// padding for tcpsize
+	x.Int(0)
+
+	newMsgId := GenerateMessageId()
+
+	if m.encrypted {
+		needAck := true
+		switch msg.(type) {
+		case TL_ping, TL_msgs_ack:
+			needAck = false
+		}
+		z := NewEncodeBuf(256)
+		z.Bytes(m.serverSalt)
+		z.Long(m.sessionId)
+		z.Long(newMsgId)
+		if needAck {
+			z.Int(m.lastSeqNo | 1)
+		} else {
+			z.Int(m.lastSeqNo)
+		}
+		log.Println()
+		log.Printf("sendByEncrypted:%t msgId: %d seqNo: %d needAck:%t type: %s", m.encrypted, newMsgId, m.lastSeqNo, needAck, reflect.TypeOf(msg).String())
+		z.Int(int32(len(obj)))
+		z.Bytes(obj)
+
+		y := make([]byte, 32+len(z.buf)+getPaddingByV2(len(z.buf)))
+		copy(y[0:32], m.authKey[88+0:88+0+32])
+		copy(y[32:], z.buf)
+		s256 := sha256(y)
+		msgKey := s256[8 : 8+16]
+
+		aesKey, aesIV := generateAESV2(msgKey, m.authKey, false)
+
+		encryptedData, err := doAES256IGEencrypt(y[32:], aesKey, aesIV)
+		if err != nil {
+			return err
+		}
+
+		m.lastSeqNo += 2
+		if needAck {
+			m.mutex.Lock()
+			m.msgsIdToAck[newMsgId] = packetToSend{msg, resp}
+			m.mutex.Unlock()
+		}
+
+		x.Bytes(m.authKeyHash)
+		x.Bytes(msgKey)
+		x.Bytes(encryptedData)
+
+		if resp != nil {
+			m.mutex.Lock()
+			m.msgsIdToResp[newMsgId] = resp
+			m.mutex.Unlock()
+		}
+
+	} else {
+		log.Println()
+		log.Printf("sendByEncrypted:%t msgId: %d type: %s", m.encrypted, newMsgId, reflect.TypeOf(msg).String())
+		x.Long(0)
+		x.Long(newMsgId)
+		x.Int(int32(len(obj)))
+		x.Bytes(obj)
+	}
+
+	// minus padding
+	size := len(x.buf)/4 - 1
+
+	// [1, 126]
+	if size < 127 {
+		x.buf[3] = byte(size)
+		x.buf = x.buf[3:]
+	} else {
+		binary.LittleEndian.PutUint32(x.buf, uint32(size<<8|127))
+	}
+	_, err := m.conn.Write(x.buf)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
 
 func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 	obj := msg.encode()
@@ -16,6 +114,8 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 	// padding for tcpsize
 	x.Int(0)
 
+	newMsgId := GenerateMessageId()
+
 	if m.encrypted {
 		needAck := true
 		switch msg.(type) {
@@ -23,7 +123,7 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 			needAck = false
 		}
 		z := NewEncodeBuf(256)
-		newMsgId := GenerateMessageId()
+		//newMsgId := GenerateMessageId()
 		z.Bytes(m.serverSalt)
 		z.Long(m.sessionId)
 		z.Long(newMsgId)
@@ -32,6 +132,8 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 		} else {
 			z.Int(m.lastSeqNo)
 		}
+		log.Println()
+		log.Printf("sendByEncrypted:%t msgId: %d seqNo: %d needAck:%t type: %s", m.encrypted, newMsgId, m.lastSeqNo, needAck, reflect.TypeOf(msg).String())
 		z.Int(int32(len(obj)))
 		z.Bytes(obj)
 
@@ -63,8 +165,10 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 		}
 
 	} else {
+		log.Println()
+		log.Printf("sendByEncrypted:%t msgId: %d type: %s", m.encrypted, newMsgId, reflect.TypeOf(msg).String())
 		x.Long(0)
-		x.Long(GenerateMessageId())
+		x.Long(newMsgId)
 		x.Int(int32(len(obj)))
 		x.Bytes(obj)
 
@@ -73,6 +177,7 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 	// minus padding
 	size := len(x.buf)/4 - 1
 
+	// [1, 126]
 	if size < 127 {
 		x.buf[3] = byte(size)
 		x.buf = x.buf[3:]
@@ -85,6 +190,111 @@ func (m *MTProto) sendPacket(msg TL, resp chan TL) error {
 	}
 
 	return nil
+}
+
+func (m *MTProto) readV2(stop <-chan struct{}) (interface{}, error) {
+	var err error
+	var n int
+	var size int
+	var data interface{}
+
+	err = m.conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+	if err != nil {
+		return nil, err
+	}
+	b := make([]byte, 1)
+	n, err = m.conn.Read(b)
+	if stop != nil {
+		select {
+		case <-stop:
+			return nil, nil
+		default:
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if b[0] < 127 {
+		size = int(b[0]) << 2
+	} else {
+		b := make([]byte, 3)
+		n, err = m.conn.Read(b)
+		if err != nil {
+			return nil, err
+		}
+		size = (int(b[0]) | int(b[1])<<8 | int(b[2])<<16) << 2
+	}
+
+	left := size
+	buf := make([]byte, size)
+	for left > 0 {
+		n, err = m.conn.Read(buf[size-left:])
+		if err != nil {
+			return nil, err
+		}
+		left -= n
+	}
+
+	if size == 4 {
+		return nil, fmt.Errorf("Server response error: %d", int32(binary.LittleEndian.Uint32(buf)))
+	}
+
+	dbuf := NewDecodeBuf(buf)
+
+	authKeyHash := dbuf.Bytes(8)
+	if binary.LittleEndian.Uint64(authKeyHash) == 0 {
+		m.msgId = dbuf.Long()
+		messageLen := dbuf.Int()
+		if int(messageLen) != dbuf.size-20 {
+			return nil, fmt.Errorf("Message len: %d (need %d)", messageLen, dbuf.size-20)
+		}
+		m.seqNo = 0
+
+		data = dbuf.Object()
+		if dbuf.err != nil {
+			return nil, dbuf.err
+		}
+
+	} else {
+		msgKey := dbuf.Bytes(16)
+		encryptedData := dbuf.Bytes(dbuf.size - 24)
+		aesKey, aesIV := generateAESV2(msgKey, m.authKey, true)
+		x, err := doAES256IGEdecrypt(encryptedData, aesKey, aesIV)
+		if err != nil {
+			return nil, err
+		}
+		{
+			tmp := make([]byte, 0, 32+len(x))
+			tmp = append(tmp, m.authKey[88+8:88+8+32]...)
+			tmp = append(tmp, x...)
+			sha256ByTmp := sha256(tmp)
+			if !bytes.Equal(sha256ByTmp[8:8+16], msgKey) {
+				return nil, errors.New("Wrong msg_key")
+			}
+		}
+		dbuf = NewDecodeBuf(x)
+		_ = dbuf.Long() // salt
+		_ = dbuf.Long() // session_id
+		m.msgId = dbuf.Long()
+		m.seqNo = dbuf.Int()
+		messageLen := dbuf.Int()
+		if int(messageLen) > dbuf.size-32 {
+			return nil, fmt.Errorf("Message len: %d (need less than %d)", messageLen, dbuf.size-32)
+		}
+
+		data = dbuf.Object()
+		if dbuf.err != nil {
+			return nil, dbuf.err
+		}
+
+	}
+	mod := m.msgId & 3
+	if mod != 1 && mod != 3 {
+		return nil, fmt.Errorf("Wrong bits of message_id: %d", mod)
+	}
+
+	return data, nil
 }
 
 func (m *MTProto) read(stop <-chan struct{}) (interface{}, error) {
@@ -193,13 +403,17 @@ func (m *MTProto) makeAuthKey() error {
 
 	// (send) req_pq
 	nonceFirst := GenerateNonce(16)
-	err = m.sendPacket(TL_req_pq{nonceFirst}, nil)
+	//err = m.sendPacket(TL_req_pq{nonceFirst}, nil)
+	err = m.sendPacketV2(TL_req_pq{nonceFirst}, nil)
 	if err != nil {
 		return err
 	}
 
 	// (parse) resPQ
-	data, err = m.read(nil)
+	// (parse) resPQ Client message identifiers are divisible by 4
+	log.Println("recv TL_resPQ")
+	//data, err = m.read(nil)
+	data, err = m.readV2(nil)
 	if err != nil {
 		return err
 	}
@@ -223,6 +437,7 @@ func (m *MTProto) makeAuthKey() error {
 
 	// (encoding) p_q_inner_data
 	p, q := splitPQ(res.pq)
+	log.Printf("pq:%s p:%s q:%s", res.pq.String(), p.String(), q.String())
 	nonceSecond := GenerateNonce(32)
 	nonceServer := res.server_nonce
 	innerData1 := (TL_p_q_inner_data{res.pq, p, q, nonceFirst, nonceServer, nonceSecond}).encode()
@@ -233,13 +448,16 @@ func (m *MTProto) makeAuthKey() error {
 	encryptedData1 := doRSAencrypt(x)
 
 	// (send) req_DH_params
-	err = m.sendPacket(TL_req_DH_params{nonceFirst, nonceServer, p, q, telegramPublicKey_FP, encryptedData1}, nil)
+	//err = m.sendPacket(TL_req_DH_params{nonceFirst, nonceServer, p, q, telegramPublicKey_FP, encryptedData1}, nil)
+	err = m.sendPacketV2(TL_req_DH_params{nonceFirst, nonceServer, p, q, telegramPublicKey_FP, encryptedData1}, nil)
 	if err != nil {
 		return err
 	}
 
 	// (parse) server_DH_params_{ok, fail}
-	data, err = m.read(nil)
+	log.Println("recv TL_server_DH_params_ok")
+	//data, err = m.read(nil)
+	data, err = m.readV2(nil)
 	if err != nil {
 		return err
 	}
@@ -302,8 +520,10 @@ func (m *MTProto) makeAuthKey() error {
 	_, g_b, g_ab := makeGAB(dhi.g, dhi.g_a, dhi.dh_prime)
 	m.authKey = g_ab.Bytes()
 	if m.authKey[0] == 0 {
+		log.Print("?")
 		m.authKey = m.authKey[1:]
 	}
+	log.Print("authKey size:", len(m.authKey))
 	m.authKeyHash = sha1(m.authKey)[12:20]
 	t4 := make([]byte, 32+1+8)
 	copy(t4[0:], nonceSecond)
@@ -322,13 +542,16 @@ func (m *MTProto) makeAuthKey() error {
 	encryptedData2, err := doAES256IGEencrypt(x, tmpAESKey, tmpAESIV)
 
 	// (send) set_client_DH_params
-	err = m.sendPacket(TL_set_client_DH_params{nonceFirst, nonceServer, encryptedData2}, nil)
+	//err = m.sendPacket(TL_set_client_DH_params{nonceFirst, nonceServer, encryptedData2}, nil)
+	err = m.sendPacketV2(TL_set_client_DH_params{nonceFirst, nonceServer, encryptedData2}, nil)
 	if err != nil {
 		return err
 	}
 
 	// (parse) dh_gen_{ok, retry, fail}
-	data, err = m.read(nil)
+	log.Println("recv TL_dh_gen_ok")
+	//data, err = m.read(nil)
+	data, err = m.readV2(nil)
 	if err != nil {
 		return err
 	}

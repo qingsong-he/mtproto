@@ -3,17 +3,21 @@ package mtproto
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"os"
+	"reflect"
 	"runtime"
 	"sync"
 	"time"
 )
 
 const (
-	appId   = 41994
-	appHash = "269069e15c81241f5670c397941016a2"
+	//appId   = 41994
+	//appHash = "269069e15c81241f5670c397941016a2"
+	appId   = 1535985
+	appHash = "fca53bea1515722b4a4dd497d438e58c"
 )
 
 type MTProto struct {
@@ -58,9 +62,13 @@ func NewMTProto(authkeyfile string) (*MTProto, error) {
 
 	err = m.readData()
 	if err == nil {
+		log.Println("start with exist profile")
 		m.encrypted = true
 	} else {
-		m.addr = "149.154.167.50:443"
+		//m.addr = "149.154.167.50:443"
+		log.Println("start with new profile")
+		m.addr = "149.154.167.40:443" // dev test
+		m.addr = "149.154.167.50:443" // dev product
 		m.encrypted = false
 	}
 	rand.Seed(time.Now().UnixNano())
@@ -89,6 +97,7 @@ func (m *MTProto) Connect() error {
 
 	// get new authKey if need
 	if !m.encrypted {
+		log.Println("get new auth key")
 		err = m.makeAuthKey()
 		if err != nil {
 			return err
@@ -104,6 +113,7 @@ func (m *MTProto) Connect() error {
 	m.msgsIdToAck = make(map[int64]packetToSend)
 	m.msgsIdToResp = make(map[int64]chan TL)
 	m.mutex = &sync.Mutex{}
+
 	go m.sendRoutine()
 	go m.readRoutine()
 
@@ -159,9 +169,9 @@ func (m *MTProto) reconnect(newaddr string) error {
 	m.stopRead <- struct{}{}
 	close(m.stopRead)
 
-	<-m.allDone
-	<-m.allDone
-	<-m.allDone
+	//<-m.allDone
+	//<-m.allDone
+	//<-m.allDone
 
 	// close send queue
 	close(m.queueSend)
@@ -172,6 +182,10 @@ func (m *MTProto) reconnect(newaddr string) error {
 		return err
 	}
 
+	<-m.allDone
+	<-m.allDone
+	<-m.allDone
+
 	// renew connection
 	m.encrypted = false
 	m.addr = newaddr
@@ -179,8 +193,9 @@ func (m *MTProto) reconnect(newaddr string) error {
 	return err
 }
 
-func (m *MTProto) Auth(phonenumber string) error {
-	var authSentCode TL_auth_sentCode
+func (m *MTProto) Auth(phonenumber string, withSMS bool) error {
+	//var authSentCode TL_auth_sentCode
+	var authSentCode TL_auth_sentAppCode
 
 	flag := true
 	for flag {
@@ -188,13 +203,17 @@ func (m *MTProto) Auth(phonenumber string) error {
 		m.queueSend <- packetToSend{TL_auth_sendCode{phonenumber, 0, appId, appHash, "en"}, resp}
 		x := <-resp
 		switch x.(type) {
-		case TL_auth_sentCode:
-			authSentCode = x.(TL_auth_sentCode)
+		//case TL_auth_sentCode:
+		//	authSentCode = x.(TL_auth_sentCode)
+		case TL_auth_sentAppCode:
+			authSentCode = x.(TL_auth_sentAppCode)
 			flag = false
+
 		case TL_rpc_error:
 			x := x.(TL_rpc_error)
 			if x.error_code != 303 {
-				return fmt.Errorf("RPC error_code: %d", x.error_code)
+				//return fmt.Errorf("RPC error_code: %d", x.error_code)
+				return fmt.Errorf("RPC error_code: %d, msg: %s", x.error_code, x.error_message)
 			}
 			var newDc int32
 			n, _ := fmt.Sscanf(x.error_message, "PHONE_MIGRATE_%d", &newDc)
@@ -209,6 +228,7 @@ func (m *MTProto) Auth(phonenumber string) error {
 			if !ok {
 				return fmt.Errorf("Wrong DC index: %d", newDc)
 			}
+			log.Println("new DC:", newDcAddr)
 			err := m.reconnect(newDcAddr)
 			if err != nil {
 				return err
@@ -220,14 +240,31 @@ func (m *MTProto) Auth(phonenumber string) error {
 	}
 
 	var code int
+	var phone_registered bool
+	var phone_code_hash string
+	phone_registered = toBool(authSentCode.phone_registered)
+	phone_code_hash = authSentCode.phone_code_hash
+	log.Println("phone_registered:", phone_registered)
+
+	if withSMS {
+		resp := make(chan TL, 1)
+		m.queueSend <- packetToSend{TL_auth_sendSms{
+			phone_number:    phonenumber,
+			phone_code_hash: authSentCode.phone_code_hash,
+		}, resp}
+		x := <-resp
+		log.Println(reflect.TypeOf(x).String())
+	}
 
 	fmt.Print("Enter code: ")
 	fmt.Scanf("%d", &code)
 
-	if toBool(authSentCode.phone_registered) {
+	//if toBool(authSentCode.phone_registered) {
+	if phone_registered {
 		resp := make(chan TL, 1)
 		m.queueSend <- packetToSend{
-			TL_auth_signIn{phonenumber, authSentCode.phone_code_hash, fmt.Sprintf("%d", code)},
+			//TL_auth_signIn{phonenumber, authSentCode.phone_code_hash, fmt.Sprintf("%d", code)},
+			TL_auth_signIn{phonenumber, phone_code_hash, fmt.Sprintf("%d", code)},
 			resp,
 		}
 		x := <-resp
@@ -240,7 +277,25 @@ func (m *MTProto) Auth(phonenumber string) error {
 
 	} else {
 
-		return errors.New("Cannot sign up yet")
+		//return errors.New("Cannot sign up yet")
+		resp := make(chan TL, 1)
+		m.queueSend <- packetToSend{
+			TL_auth_signUp{
+				phone_number:    phonenumber,
+				phone_code_hash: phone_code_hash,
+				phone_code:      fmt.Sprintf("%d", code),
+				first_name:      "foobar",
+				last_name:       "foobar",
+			},
+			resp,
+		}
+		x := <-resp
+		auth, ok := x.(TL_auth_authorization)
+		if !ok {
+			return fmt.Errorf("RPC: %#v", x)
+		}
+		userSelf := auth.user.(TL_userSelf)
+		fmt.Printf("Signed in: id %d name <%s %s>\n", userSelf.id, userSelf.first_name, userSelf.last_name)
 	}
 
 	return nil
@@ -312,10 +367,12 @@ func (m *MTProto) pingRoutine() {
 
 func (m *MTProto) sendRoutine() {
 	for x := range m.queueSend {
-		err := m.sendPacket(x.msg, x.resp)
+		//err := m.sendPacket(x.msg, x.resp)
+		err := m.sendPacketV2(x.msg, x.resp)
 		if err != nil {
-			fmt.Println("SendRoutine:", err)
-			os.Exit(2)
+			//fmt.Println("SendRoutine:", err)
+			//os.Exit(2)
+			log.Fatalln(err)
 		}
 	}
 
@@ -324,22 +381,27 @@ func (m *MTProto) sendRoutine() {
 
 func (m *MTProto) readRoutine() {
 	for {
-		data, err := m.read(m.stopRead)
+		//data, err := m.read(m.stopRead)
+		data, err := m.readV2(m.stopRead)
 		if err != nil {
-			fmt.Println("ReadRoutine:", err)
-			os.Exit(2)
+			//fmt.Println("ReadRoutine:", err)
+			//os.Exit(2)
+			log.Fatalln(err)
 		}
 		if data == nil {
+			log.Println("nil data")
 			m.allDone <- struct{}{}
 			return
 		}
 
+		log.Println("recv in readRoutine")
 		m.process(m.msgId, m.seqNo, data)
 	}
 
 }
 
 func (m *MTProto) process(msgId int64, seqNo int32, data interface{}) interface{} {
+	log.Printf("recvByEncrypted:%t msgId: %d seqNo: %d type: %s", m.encrypted, msgId, seqNo, reflect.TypeOf(data).String())
 	switch data.(type) {
 	case TL_msg_container:
 		data := data.(TL_msg_container).items
@@ -397,6 +459,7 @@ func (m *MTProto) process(msgId int64, seqNo int32, data interface{}) interface{
 	}
 
 	if (seqNo & 1) == 1 {
+		log.Printf("%s send ack", reflect.TypeOf(data).String())
 		m.queueSend <- packetToSend{TL_msgs_ack{[]int64{msgId}}, nil}
 	}
 
